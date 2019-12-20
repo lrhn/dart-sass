@@ -962,6 +962,8 @@ abstract class StylesheetParser extends Parser {
       hiddenVariables = members.item2;
     }
 
+    var configuration = _configuration(allowGuarded: true);
+
     expectStatementSeparator("@forward rule");
     var span = scanner.spanFrom(start);
     if (!_isUseAllowed) {
@@ -971,13 +973,14 @@ abstract class StylesheetParser extends Parser {
     if (shownMixinsAndFunctions != null) {
       return ForwardRule.show(
           url, shownMixinsAndFunctions, shownVariables, span,
-          prefix: prefix);
+          prefix: prefix, configuration: configuration);
     } else if (hiddenMixinsAndFunctions != null) {
       return ForwardRule.hide(
           url, hiddenMixinsAndFunctions, hiddenVariables, span,
-          prefix: prefix);
+          prefix: prefix, configuration: configuration);
     } else {
-      return ForwardRule(url, span, prefix: prefix);
+      return ForwardRule(url, span,
+          prefix: prefix, configuration: configuration);
     }
   }
 
@@ -987,8 +990,8 @@ abstract class StylesheetParser extends Parser {
   /// The plain identifiers are returned in the first set, and the variable
   /// names in the second.
   Tuple2<Set<String>, Set<String>> _memberList() {
-    var identifiers = Set<String>();
-    var variables = Set<String>();
+    var identifiers = <String>{};
+    var variables = <String>{};
     do {
       whitespace();
       withErrorMessage("Expected variable, mixin, or function name", () {
@@ -1350,7 +1353,7 @@ relase. For details, see http://bit.ly/moz-document.
 
     var namespace = _useNamespace(url, start);
     whitespace();
-    var configuration = _useConfiguration();
+    var configuration = _configuration();
 
     expectStatementSeparator("@use rule");
 
@@ -1381,14 +1384,18 @@ relase. For details, see http://bit.ly/moz-document.
     }
   }
 
-  /// Returns the map from variable names to expressions from a `@use` rule's
-  /// `with` clause.
+  /// Returns the list of configured variables from a `@use` or `@forward`
+  /// rule's `with` clause.
+  ///
+  /// If `allowGuarded` is `true`, this will allow configured variable with the
+  /// `!default` flag.
   ///
   /// Returns `null` if there is no `with` clause.
-  Map<String, Tuple2<Expression, FileSpan>> _useConfiguration() {
+  List<ConfiguredVariable> _configuration({bool allowGuarded = false}) {
     if (!scanIdentifier("with")) return null;
 
-    var configuration = <String, Tuple2<Expression, FileSpan>>{};
+    var variableNames = <String>{};
+    var configuration = <ConfiguredVariable>[];
     whitespace();
     scanner.expectChar($lparen);
 
@@ -1401,12 +1408,25 @@ relase. For details, see http://bit.ly/moz-document.
       scanner.expectChar($colon);
       whitespace();
       var expression = _expressionUntilComma();
-      var span = scanner.spanFrom(variableStart);
 
-      if (configuration.containsKey(name)) {
+      var guarded = false;
+      var flagStart = scanner.state;
+      if (allowGuarded && scanner.scanChar($exclamation)) {
+        var flag = identifier();
+        if (flag == 'default') {
+          guarded = true;
+        } else {
+          error("Invalid flag name.", scanner.spanFrom(flagStart));
+        }
+      }
+
+      var span = scanner.spanFrom(variableStart);
+      if (variableNames.contains(name)) {
         error("The same variable may only be configured once.", span);
       }
-      configuration[name] = Tuple2(expression, span);
+      variableNames.add(name);
+      configuration
+          .add(ConfiguredVariable(name, expression, span, guarded: guarded));
 
       if (!scanner.scanChar($comma)) break;
       whitespace();
@@ -1625,7 +1645,7 @@ relase. For details, see http://bit.ly/moz-document.
 
     // Resets the scanner state to the state it was at at the beginning of the
     // expression, except for [_inParentheses].
-    resetState() {
+    void resetState() {
       commaExpressions = null;
       spaceExpressions = null;
       operators = null;
@@ -1635,7 +1655,7 @@ relase. For details, see http://bit.ly/moz-document.
       singleExpression = _singleExpression();
     }
 
-    resolveOneOperation() {
+    void resolveOneOperation() {
       var operator = operators.removeLast();
       if (operator != BinaryOperator.dividedBy) allowSlash = false;
       if (allowSlash && !_inParentheses) {
@@ -1647,14 +1667,14 @@ relase. For details, see http://bit.ly/moz-document.
       }
     }
 
-    resolveOperations() {
+    void resolveOperations() {
       if (operators == null) return;
       while (operators.isNotEmpty) {
         resolveOneOperation();
       }
     }
 
-    addSingleExpression(Expression expression, {bool number = false}) {
+    void addSingleExpression(Expression expression, {bool number = false}) {
       if (singleExpression != null) {
         // If we discover we're parsing a list whose first element is a division
         // operation, and we're in parentheses, reparse outside of a paren
@@ -1679,7 +1699,7 @@ relase. For details, see http://bit.ly/moz-document.
       singleExpression = expression;
     }
 
-    addOperator(BinaryOperator operator) {
+    void addOperator(BinaryOperator operator) {
       if (plainCss && operator != BinaryOperator.dividedBy) {
         scanner.error("Operators aren't allowed in plain CSS.",
             position: scanner.position - operator.operator.length,
@@ -1704,7 +1724,7 @@ relase. For details, see http://bit.ly/moz-document.
       allowSlash = allowSlash && singleExpression is NumberExpression;
     }
 
-    resolveSpaceExpressions() {
+    void resolveSpaceExpressions() {
       resolveOperations();
 
       if (spaceExpressions != null) {

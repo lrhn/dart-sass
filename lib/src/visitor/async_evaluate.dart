@@ -22,6 +22,8 @@ import '../async_environment.dart';
 import '../async_import_cache.dart';
 import '../callable.dart';
 import '../color_names.dart';
+import '../configuration.dart';
+import '../configured_value.dart';
 import '../exception.dart';
 import '../extend/extender.dart';
 import '../extend/extension.dart';
@@ -37,8 +39,6 @@ import '../module/built_in.dart';
 import '../parse/keyframe_selector.dart';
 import '../syntax.dart';
 import '../util/fixed_length_list_builder.dart';
-import '../util/limited_map_view.dart';
-import '../util/unprefixed_map_view.dart';
 import '../utils.dart';
 import '../value.dart';
 import '../warn.dart';
@@ -198,13 +198,13 @@ class _EvaluateVisitor
   ///
   /// For filesystem imports, this contains the import path. For all other
   /// imports, it contains the URL passed to the `@import`.
-  final _includedFiles = Set<String>();
+  final _includedFiles = <String>{};
 
   /// The set of canonical URLs for modules (or imported files) that are
   /// currently being evaluated.
   ///
   /// This is used to ensure that we don't get into an infinite load loop.
-  final _activeModules = Set<Uri>();
+  final _activeModules = <Uri>{};
 
   /// The dynamic call stack representing function invocations, mixin
   /// invocations, and imports surrounding the current context.
@@ -251,13 +251,10 @@ class _EvaluateVisitor
   /// module.
   Extender _extender;
 
-  /// A map from variable names to the values that override their `!default`
-  /// definitions in this module.
+  /// The configuration for the current module.
   ///
   /// If this is empty, that indicates that the current module is not confiured.
-  /// Note that it may be unmodifiable when empty, in which case [Map.remove]
-  /// must not be called.
-  var _configuration = const <String, _ConfiguredValue>{};
+  var _configuration = const Configuration.empty();
 
   /// Creates a new visitor.
   ///
@@ -413,19 +410,20 @@ class _EvaluateVisitor
         var url = Uri.parse(arguments[0].assertString("module").text);
         var withMap = arguments[1].realNull?.assertMap("with")?.contents;
 
-        var configuration = const <String, _ConfiguredValue>{};
+        var configuration = const Configuration.empty();
         if (withMap != null) {
-          configuration = {};
+          var values = <String, ConfiguredValue>{};
           var span = _callableNode.span;
           withMap.forEach((variable, value) {
             var name =
                 variable.assertString("with key").text.replaceAll("_", "-");
-            if (configuration.containsKey(name)) {
+            if (values.containsKey(name)) {
               throw "The variable \$$name was configured twice.";
             }
 
-            configuration[name] = _ConfiguredValue(value, span);
+            values[name] = ConfiguredValue(value, span);
           });
+          configuration = Configuration(values);
         }
 
         await _loadModule(url, "load-css()", _callableNode,
@@ -433,6 +431,8 @@ class _EvaluateVisitor
             baseUrl: _callableNode.span?.sourceUrl,
             configuration: configuration,
             namesInErrors: true);
+        _assertConfigurationIsEmpty(configuration, nameInError: true);
+
         return null;
       })
     ];
@@ -523,11 +523,11 @@ class _EvaluateVisitor
   Future<void> _loadModule(Uri url, String stackFrame, AstNode nodeForSpan,
       void callback(Module module),
       {Uri baseUrl,
-      Map<String, _ConfiguredValue> configuration,
+      Configuration configuration,
       bool namesInErrors = false}) async {
     var builtInModule = _builtInModules[url];
     if (builtInModule != null) {
-      if (configuration != null && configuration.isNotEmpty) {
+      if (configuration != null && !configuration.isImplicit) {
         throw _exception(
             namesInErrors
                 ? "Built-in module $url can't be configured."
@@ -576,22 +576,19 @@ class _EvaluateVisitor
 
   /// Executes [stylesheet], loaded by [importer], to produce a module.
   ///
-  /// The [configuration] overrides values for `!default` variables defined in
-  /// the module or modules it forwards and/or imports. If it's not passed, the
-  /// current configuration is used instead. Throws a [SassRuntimeException] if
-  /// a configured variable is not declared with `!default`.
+  /// If [configuration] is not passed, the current configuration is used
+  /// instead.
   ///
-  /// If [namesInErrors] is `true`, this includes the names of modules or
-  /// configured variables in errors relating to them. This should only be
-  /// `true` if the names won't be obvious from the source span.
+  /// If [namesInErrors] is `true`, this includes the names of modules in errors
+  /// relating to them. This should only be `true` if the names won't be obvious
+  /// from the source span.
   Future<Module> _execute(AsyncImporter importer, Stylesheet stylesheet,
-      {Map<String, _ConfiguredValue> configuration,
-      bool namesInErrors = false}) async {
+      {Configuration configuration, bool namesInErrors = false}) async {
     var url = stylesheet.span.sourceUrl;
 
     var alreadyLoaded = _modules[url];
     if (alreadyLoaded != null) {
-      if ((configuration ?? _configuration).isNotEmpty) {
+      if (!(configuration ?? _configuration).isImplicit) {
         throw _exception(namesInErrors
             ? "${p.prettyUri(url)} was already loaded, so it can't be "
                 "configured using \"with\"."
@@ -633,11 +630,7 @@ class _EvaluateVisitor
       _inUnknownAtRule = false;
       _atRootExcludingStyleRule = false;
       _inKeyframes = false;
-
-      if (configuration != null) {
-        _configuration =
-            configuration.isEmpty ? const {} : Map.of(configuration);
-      }
+      if (configuration != null) _configuration = configuration;
 
       await visitStylesheet(stylesheet);
       css = _outOfOrderImports == null
@@ -657,16 +650,6 @@ class _EvaluateVisitor
       _inUnknownAtRule = oldInUnknownAtRule;
       _atRootExcludingStyleRule = oldAtRootExcludingStyleRule;
       _inKeyframes = oldInKeyframes;
-
-      if (configuration != null && _configuration.isNotEmpty) {
-        throw _exception(
-            namesInErrors
-                ? "\$${_configuration.keys.first} was not declared with "
-                    "!default in the @used module."
-                : "This variable was not declared with !default in the @used "
-                    "module.",
-            _configuration.values.first.configurationSpan);
-      }
       _configuration = oldConfiguration;
     });
 
@@ -791,7 +774,7 @@ class _EvaluateVisitor
   List<Module> _topologicalModules(Module root) {
     // Construct a topological ordering using depth-first traversal, as in
     // https://en.wikipedia.org/wiki/Topological_sorting#Depth-first_search.
-    var seen = Set<Module>();
+    var seen = <Module>{};
     var sorted = QueueList<Module>();
 
     void visitModule(Module module) {
@@ -1203,32 +1186,92 @@ class _EvaluateVisitor
   }
 
   Future<Value> visitForwardRule(ForwardRule node) async {
-    // Only allow variables that are visible through the `@forward` to be
-    // configured. These views support [Map.remove] so we can mark when a
-    // configuration variable is used by removing it even when the underlying
-    // map is wrapped.
     var oldConfiguration = _configuration;
-    if (_configuration.isNotEmpty) {
-      if (node.prefix != null) {
-        _configuration = UnprefixedMapView(_configuration, node.prefix);
-      }
+    var adjustedConfiguration = oldConfiguration.throughForward(node);
 
-      if (node.shownVariables != null) {
-        _configuration =
-            LimitedMapView.whitelist(_configuration, node.shownVariables);
-      } else if (node.hiddenVariables != null &&
-          node.hiddenVariables.isNotEmpty) {
-        _configuration =
-            LimitedMapView.blacklist(_configuration, node.hiddenVariables);
-      }
+    if (node.configuration.isNotEmpty) {
+      var newConfiguration =
+          await _addForwardConfiguration(adjustedConfiguration, node);
+
+      await _loadModule(node.url, "@forward", node, (module) {
+        _environment.forwardModule(module, node);
+      }, configuration: newConfiguration);
+
+      _removeUsedConfiguration(adjustedConfiguration, newConfiguration,
+          except: node.configuration.isEmpty
+              ? const {}
+              : {
+                  for (var variable in node.configuration)
+                    if (!variable.isGuarded) variable.name
+                });
+
+      _assertConfigurationIsEmpty(newConfiguration,
+          only: {for (var variable in node.configuration) variable.name});
+    } else {
+      _configuration = adjustedConfiguration;
+      await _loadModule(node.url, "@forward", node, (module) {
+        _environment.forwardModule(module, node);
+      });
+      _configuration = oldConfiguration;
     }
 
-    await _loadModule(node.url, "@forward", node, (module) {
-      _environment.forwardModule(module, node);
-    });
-
-    _configuration = oldConfiguration;
     return null;
+  }
+
+  /// Updates [configuration] to include [node]'s configuration and return the
+  /// result.
+  Future<Configuration> _addForwardConfiguration(
+      Configuration configuration, ForwardRule node) async {
+    var newValues = Map.of(configuration.values);
+    for (var variable in node.configuration) {
+      if (variable.isGuarded) {
+        var oldValue = configuration.remove(variable.name);
+        if (oldValue != null && oldValue.value != sassNull) {
+          newValues[variable.name] = oldValue;
+          continue;
+        }
+      }
+
+      newValues[variable.name] = ConfiguredValue(
+          (await variable.expression.accept(this)).withoutSlash(),
+          variable.span,
+          _expressionNode(variable.expression));
+    }
+
+    return Configuration(newValues);
+  }
+
+  /// Remove configured values from [upstream] that have been removed from
+  /// [downstream], unless they match a name in [except].
+  void _removeUsedConfiguration(
+      Configuration upstream, Configuration downstream,
+      {@required Set<String> except}) {
+    for (var name in upstream.values.keys.toList()) {
+      if (except.contains(name)) continue;
+      if (!downstream.values.containsKey(name)) upstream.remove(name);
+    }
+  }
+
+  /// Throws an error if [configuration] contains any values.
+  ///
+  /// If [only] is passed, this will only throw an error for configured values
+  /// with the given names.
+  ///
+  /// If [nameInError] is `true`, this includes the name of the configured
+  /// variable in the error message. This should only be `true` if the name
+  /// won't be obvious from the source span.
+  void _assertConfigurationIsEmpty(Configuration configuration,
+      {Set<String> only, bool nameInError = false}) {
+    configuration.values.forEach((name, value) {
+      if (only != null && !only.contains(name)) return;
+
+      throw _exception(
+          nameInError
+              ? "\$$name was not declared with !default in the @used module."
+              : "This variable was not declared with !default in the @used "
+                  "module.",
+          value.configurationSpan);
+    });
   }
 
   Future<Value> visitFunctionRule(FunctionRule node) async {
@@ -1283,16 +1326,13 @@ class _EvaluateVisitor
       // need to put its CSS into an intermediate [ModifiableCssStylesheet] so
       // that we can hermetically resolve `@extend`s before injecting it.
       if (stylesheet.uses.isEmpty && stylesheet.forwards.isEmpty) {
-        var environment = _environment.global();
-        await _withEnvironment(environment, () async {
-          var oldImporter = _importer;
-          var oldStylesheet = _stylesheet;
-          _importer = importer;
-          _stylesheet = stylesheet;
-          await visitStylesheet(stylesheet);
-          _importer = oldImporter;
-          _stylesheet = oldStylesheet;
-        });
+        var oldImporter = _importer;
+        var oldStylesheet = _stylesheet;
+        _importer = importer;
+        _stylesheet = stylesheet;
+        await visitStylesheet(stylesheet);
+        _importer = oldImporter;
+        _stylesheet = oldStylesheet;
         _activeModules.remove(url);
         return;
       }
@@ -1306,12 +1346,19 @@ class _EvaluateVisitor
         var oldParent = _parent;
         var oldEndOfImports = _endOfImports;
         var oldOutOfOrderImports = _outOfOrderImports;
+        var oldConfiguration = _configuration;
         _importer = importer;
         _stylesheet = stylesheet;
         _root = ModifiableCssStylesheet(stylesheet.span);
         _parent = _root;
         _endOfImports = 0;
         _outOfOrderImports = null;
+
+        // This configuration is only used if it passes through a `@forward`
+        // rule, so we avoid creating unnecessary ones for performance reasons.
+        if (stylesheet.forwards.isNotEmpty) {
+          _configuration = environment.toImplicitConfiguration();
+        }
 
         await visitStylesheet(stylesheet);
         children = _addOutOfOrderImports();
@@ -1322,6 +1369,7 @@ class _EvaluateVisitor
         _parent = oldParent;
         _endOfImports = oldEndOfImports;
         _outOfOrderImports = oldOutOfOrderImports;
+        _configuration = oldConfiguration;
       });
 
       // Create a dummy module with empty CSS and no extensions to make forwarded
@@ -1469,7 +1517,7 @@ class _EvaluateVisitor
         await _environment.withContent(contentCallable, () async {
           await _environment.asMixin(() async {
             for (var statement in mixin.declaration.children) {
-              await statement.accept(this);
+              await _addErrorSpan(node, () => statement.accept(this));
             }
           });
           return null;
@@ -1729,12 +1777,7 @@ class _EvaluateVisitor
   Future<Value> visitVariableDeclaration(VariableDeclaration node) async {
     if (node.isGuarded) {
       if (node.namespace == null && _environment.atRoot) {
-        // Explicitly check whether [_configuration] is empty because if it is,
-        // it may be a constant map which doesn't support `remove()`.
-        //
-        // See also dart-lang/sdk#38540.
-        var override =
-            _configuration.isEmpty ? null : _configuration.remove(node.name);
+        var override = _configuration.remove(node.name);
         if (override != null) {
           _addExceptionSpan(node, () {
             _environment.setVariable(
@@ -1776,18 +1819,20 @@ class _EvaluateVisitor
   }
 
   Future<Value> visitUseRule(UseRule node) async {
+    var configuration = node.configuration.isEmpty
+        ? const Configuration.empty()
+        : Configuration({
+            for (var variable in node.configuration)
+              variable.name: ConfiguredValue(
+                  (await variable.expression.accept(this)).withoutSlash(),
+                  variable.span,
+                  _expressionNode(variable.expression))
+          });
+
     await _loadModule(node.url, "@use", node, (module) {
       _environment.addModule(module, namespace: node.namespace);
-    },
-        configuration: node.configuration.isEmpty
-            ? const {}
-            : {
-                for (var entry in node.configuration.entries)
-                  entry.key: _ConfiguredValue(
-                      (await entry.value.item1.accept(this)).withoutSlash(),
-                      entry.value.item2,
-                      _expressionNode(entry.value.item1))
-              });
+    }, configuration: configuration);
+    _assertConfigurationIsEmpty(configuration);
 
     return null;
   }
@@ -1983,7 +2028,8 @@ class _EvaluateVisitor
 
     var oldInFunction = _inFunction;
     _inFunction = true;
-    var result = await _runFunctionCallable(node.arguments, function, node);
+    var result = await _addErrorSpan(
+        node, () => _runFunctionCallable(node.arguments, function, node));
     _inFunction = oldInFunction;
     return result;
   }
@@ -2853,6 +2899,19 @@ class _EvaluateVisitor
       throw _exception(error.message, nodeWithSpan.span);
     }
   }
+
+  /// Runs [callback], and converts any [SassRuntimeException]s containing an
+  /// @error to throw a more relevant [SassRuntimeException] with [nodeWithSpan]'s
+  /// source span.
+  Future<T> _addErrorSpan<T>(AstNode nodeWithSpan, Future<T> callback()) async {
+    try {
+      return await callback();
+    } on SassRuntimeException catch (error) {
+      if (!error.span.text.startsWith("@error")) rethrow;
+      throw SassRuntimeException(
+          error.message, nodeWithSpan.span, _stackTrace());
+    }
+  }
 }
 
 /// A helper class for [_EvaluateVisitor] that adds `@import`ed CSS nodes to the
@@ -2970,20 +3029,4 @@ class _ArgumentResults {
 
   _ArgumentResults(this.positional, this.named, this.separator,
       {this.positionalNodes, this.namedNodes});
-}
-
-/// A variable value that's been configured using `@use ... with`.
-class _ConfiguredValue {
-  /// The value of the variable.
-  final Value value;
-
-  /// The span where the variable's configuration was written.
-  final FileSpan configurationSpan;
-
-  /// The [AstNode] where the variable's value originated.
-  ///
-  /// This is used to generate source maps.
-  final AstNode assignmentNode;
-
-  _ConfiguredValue(this.value, this.configurationSpan, [this.assignmentNode]);
 }

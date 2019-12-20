@@ -1,3 +1,46 @@
+## 1.24.0
+
+* Add an optional `with` clause to the `@forward` rule. This works like the
+  `@use` rule's `with` clause, except that `@forward ... with` can declare
+  variables as `!default` to allow downstream modules to reconfigure their
+  values.
+
+* Support configuring modules through `@import` rules.
+
+## 1.23.8
+
+* **Potentially breaking bug fix:** Members loaded through a nested `@import`
+  are no longer ever accessible outside that nested context.
+
+* Don't throw an error when importing two modules that both forward members with
+  the same name. The latter name now takes precedence over the former, as per
+  the specification.
+
+### Dart API
+
+* `SassFormatException` now implements `SourceSpanFormatException` (and thus
+  `FormatException`).
+
+## 1.23.7
+
+* No user-visible changes
+
+## 1.23.6
+
+* No user-visible changes.
+
+## 1.23.5
+
+* Support inline comments in the indented syntax.
+
+* When an overloaded function receives the wrong number of arguments, guess
+  which overload the user actually meant to invoke, and display the invalid
+  argument error for that overload.
+
+* When `@error` is used in a function or mixin, print the call site rather than
+  the location of the `@error` itself to better match the behavior of calling a
+  built-in function that throws an error.
+
 ## 1.23.4
 
 ### Command-Line Interface
